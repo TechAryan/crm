@@ -1,0 +1,48 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: nexcrm
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: { context: ., dockerfile: deploy/Dockerfile.api }
+    environment:
+      DATABASE_URL: postgres://crm_app:crm_app_pw@db:5432/nexcrm
+      DATABASE_ADMIN_URL: postgres://postgres:postgres@db:5432/nexcrm
+      DB_MODE: external
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      HOST_JWT_SECRET: ${HOST_JWT_SECRET:-dev-host-secret-change-me}
+      # Local-dev key only. Production must supply a real one (openssl rand -base64 32)
+      # from a secrets manager; the API refuses to boot in production without it.
+      CREDENTIALS_KEY: ${CREDENTIALS_KEY:-ZGV2LW9ubHkta2V5LWZvci1sb2NhbC0zMmJ5dGVzLTEyMw==}
+      PORT: 4000
+    ports: ["4000:4000"]
+    depends_on:
+      db: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4000/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    command: sh -c "node dist/scripts/migrate.js && node dist/scripts/seed.js && node dist/src/index.js"
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.web
+      args: { VITE_API_URL: "http://localhost:4000" }
+    ports: ["3000:80"]
+    depends_on: [api]
+
+volumes:
+  pgdata:

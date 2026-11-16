@@ -1,0 +1,45 @@
+# NexCRM edge proxy.
+#
+# WHY CADDY RATHER THAN NGINX + CERTBOT: Caddy obtains and renews Let's Encrypt certificates
+# automatically, with no cron job and no renewal hook to forget. An expired certificate is one of
+# the most common ways a small SaaS goes down, and it always happens on a weekend. The nginx
+# config still exists and still serves the SPA — it just runs *behind* this, inside the web
+# container, with no TLS concerns of its own.
+#
+# Replace the two domains below, or set APP_DOMAIN / API_DOMAIN in .env.production.
+# DNS for both must already point at this server's public IP before first start, or the
+# certificate request will fail (and Let's Encrypt rate-limits repeated failures).
+
+{
+	# Let's Encrypt uses this for expiry warnings. Worth setting.
+	email {$ACME_EMAIL}
+
+	# Uncomment while testing to use the staging CA. Staging certs are untrusted by browsers but
+	# are not rate-limited, so use it if you expect several failed attempts.
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+# ---- Frontend ----
+{$APP_DOMAIN} {
+	encode gzip zstd
+	reverse_proxy web:80
+
+	# HSTS. Only safe once HTTPS works, which by this point it does.
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+}
+
+# ---- API ----
+{$API_DOMAIN} {
+	encode gzip zstd
+	reverse_proxy api:4000 {
+		# The app logs request ids and rate-limits per tenant; both need the real client IP
+		# rather than the proxy's.
+		header_up X-Real-IP {remote_host}
+	}
+
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	# Payment webhooks (Razorpay/Stripe) sign the raw body. Caddy passes bodies through
+	# unmodified, so no special handling is needed — noted here so nobody "optimises" this
+	# block later by adding body rewriting and silently breaks signature verification.
+}

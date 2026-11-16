@@ -1,0 +1,133 @@
+# NexCRM production stack — single VM (Oracle Cloud Ampere A1, Mumbai).
+#
+#   docker compose -f deploy/docker-compose.prod.yml --env-file .env.production up -d --build
+#
+# Shape of the deployment and why:
+#
+#   caddy   Edge. Terminates TLS with automatic Let's Encrypt certificates. The ONLY container
+#           publishing ports to the internet.
+#   web     nginx serving the built SPA. Not published — reachable only through caddy.
+#   api     HTTP only. Background jobs disabled (RUN_BACKGROUND_JOBS=false).
+#   worker  Same image, WORKER_ONLY=true. Runs the scheduler, webhook dispatcher and retention
+#           purge. Separated because a retention sweep competing with request handling shows up
+#           directly as p95 latency, and because jobs must run exactly once — running them in
+#           every web replica would duplicate work the moment you scale past one.
+#   db      Postgres 16. NO published port: it is reachable only on the private compose network.
+#           Exposing 5432 to the internet is how small SaaS databases get ransomwared.
+#
+# Everything restarts unless explicitly stopped, so the stack survives a VM reboot.
+
+name: nexcrm
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # certificates live here — back this up or expect re-issuance
+      - caddy_config:/config
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN in .env.production}
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in .env.production}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env.production}
+    depends_on: [web, api]
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_DB: nexcrm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d nexcrm"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # Tuned for the Always Free A1 shape (4 OCPU / 24 GB). Postgres defaults assume a far
+    # smaller machine and will leave most of this RAM unused.
+    command: >
+      postgres
+      -c shared_buffers=2GB
+      -c effective_cache_size=6GB
+      -c maintenance_work_mem=512MB
+      -c work_mem=16MB
+      -c max_connections=100
+      -c checkpoint_completion_target=0.9
+      -c wal_compression=on
+      -c log_min_duration_statement=1000
+    deploy:
+      resources:
+        limits: { memory: 10G }
+
+  api:
+    build:
+      # Relative to THIS FILE's directory (deploy/), so '..' is the repo root. The Dockerfile
+      # path is then relative to that context. Getting this wrong fails late, inside the build,
+      # with a confusing "package.json not found".
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    restart: unless-stopped
+    env_file: [../.env.production]
+    environment:
+      DB_MODE: external
+      PORT: 4000
+      WORKER_ONLY: "false"
+      # Background jobs belong to the worker. Leaving this true here would run every scheduled
+      # job twice — once per container — which for retention purges means doing destructive
+      # work concurrently with itself.
+      RUN_BACKGROUND_JOBS: "false"
+      LOG_FORMAT: json
+    depends_on:
+      db: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4000/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits: { memory: 4G }
+
+  worker:
+    build:
+      # Relative to THIS FILE's directory (deploy/), so '..' is the repo root. The Dockerfile
+      # path is then relative to that context. Getting this wrong fails late, inside the build,
+      # with a confusing "package.json not found".
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    restart: unless-stopped
+    env_file: [../.env.production]
+    environment:
+      DB_MODE: external
+      WORKER_ONLY: "true"
+      LOG_FORMAT: json
+    depends_on:
+      db: { condition: service_healthy }
+      api: { condition: service_healthy }   # let the API run migrations first
+    deploy:
+      resources:
+        limits: { memory: 2G }
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+      args:
+        # BUILD-time, not runtime: Vite inlines this into the bundle. Changing it later requires
+        # a rebuild, not a restart.
+        VITE_API_URL: https://${API_DOMAIN}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

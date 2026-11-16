@@ -1,0 +1,47 @@
+# NexCRM API — multi-stage build
+FROM node:22-alpine AS build
+WORKDIR /repo
+COPY package.json package-lock.json* ./
+COPY apps/api/package.json apps/api/package.json
+COPY apps/web/package.json apps/web/package.json
+# npm ci gives reproducible installs from the lockfile (npm install can drift versions).
+RUN npm ci --no-audit --no-fund
+COPY apps/api apps/api
+COPY db db
+RUN npm run build -w apps/api
+# Drop dev dependencies from the layer we copy forward.
+RUN npm prune --omit=dev
+
+FROM node:22-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+
+# dumb-init as PID 1 so SIGTERM actually reaches Node and the graceful-shutdown handler runs
+# (draining in-flight requests during a rolling deploy instead of dropping them).
+# curl is used by the healthcheck.
+RUN apk add --no-cache dumb-init curl
+
+COPY --from=build /repo/apps/api/package.json ./package.json
+COPY --from=build /repo/node_modules ./node_modules
+COPY --from=build /repo/apps/api/dist ./dist
+# NOTE: destination is intentionally "../db" (i.e. /db, a sibling of /app). db.ts resolves the
+# migrations directory relative to the compiled dist/src/db.js location (three levels up +
+# "db/migrations"), which lands on /db/migrations given WORKDIR /app. Verified by simulation —
+# don't "simplify" this path without re-checking apps/api/src/db.ts's migrate() path math.
+# MIGRATIONS_DIR below makes it explicit regardless.
+COPY --from=build /repo/db ../db
+ENV MIGRATIONS_DIR=/db/migrations
+
+# Run unprivileged: a container compromise shouldn't also be root inside the container.
+RUN addgroup -S app && adduser -S app -G app && chown -R app:app /app /db
+USER app
+
+EXPOSE 4000
+
+# Readiness (checks DB reachability), not just liveness — a node that can't reach Postgres
+# should be pulled from the load balancer rather than serving 500s.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:4000/ready || exit 1
+
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "dist/src/index.js"]
